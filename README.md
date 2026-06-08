@@ -52,12 +52,12 @@ Supporting sections are displayed below the answer for transparency.
 
 ### 1. Clone the repository
 
-git clone <repo-url>
+git clone https://github.com/HFaris01/ai-doc-assistant.git
 cd ai-doc-assistant
 
 ### 2. Create and activate a virtual environment
 
-Windows PowerShell:
+In Windows PowerShell, run:
 
 python -m venv .venv
 .venv\Scripts\Activate.ps1
