@@ -1,0 +1,8 @@
+streamlit
+docling
+scikit-learn
+nltk
+pandas
+numpy
+sentence-transformers
+ollama
