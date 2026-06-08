@@ -52,19 +52,23 @@ Supporting sections are displayed below the answer for transparency.
 
 ### 1. Clone the repository
 
-git clone https://github.com/HFaris01/ai-doc-assistant.git
-cd ai-doc-assistant
+Run:
+
+    git clone https://github.com/HFaris01/ai-doc-assistant.git
+    cd ai-doc-assistant
 
 ### 2. Create and activate a virtual environment
 
 In Windows PowerShell, run:
 
-python -m venv .venv
-.venv\Scripts\Activate.ps1
+    python -m venv .venv
+    .venv\Scripts\Activate.ps1
 
 ### 3. Install dependencies
 
-pip install -r requirements.txt
+Run:
+
+    pip install -r requirements.txt
 
 ### 4. Install and run Ollama
 
@@ -72,15 +76,17 @@ Install Ollama from the official website.
 
 Then pull a local model, for example:
 
-ollama pull gemma3:latest
+    ollama pull gemma3:latest
 
 You can verify it with:
 
-ollama list
+    ollama list
 
 ### 5. Run the app
 
-streamlit run app.py
+Start the Streamlit app with:
+
+    streamlit run app.py
 
 ## Answer Modes
 
