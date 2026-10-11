@@ -1,4 +1,5 @@
 import os
+from hashlib import sha256
 
 import streamlit as st
 from sentence_transformers import CrossEncoder, SentenceTransformer
@@ -13,7 +14,11 @@ from utils.nlp_utils import (
     rerank_chunks,
     summarize_chunks,
 )
-from utils.ollama_utils import check_ollama_connection, generate_grounded_answer_ollama
+from utils.ollama_utils import (
+    INSUFFICIENT_CONTEXT_MESSAGE,
+    check_ollama_connection,
+    generate_grounded_answer_ollama,
+)
 
 
 APP_TITLE = "AI Doc Assistant"
@@ -165,9 +170,9 @@ def render_sidebar_tools(show_debug_default: bool = False) -> tuple[bool, str, s
 
 
 def render_header() -> None:
-    st.title("📄 AI Doc Assistant")
+    st.title(APP_TITLE)
     st.write(
-        "Upload a PDF, generate a summary, extract keywords, and ask questions about the document."
+        "Upload a PDF to ask questions about its contents."
     )
 
 
@@ -184,7 +189,7 @@ def render_summary_tab(chunk_texts: list[str], chunk_embeddings: list[list[float
 
 
 def render_keywords_tab(full_text: str) -> None:
-    st.subheader("Top Keywords")
+    st.subheader("Keywords")
 
     keywords = extract_keywords(full_text, top_n=15)
 
@@ -193,7 +198,7 @@ def render_keywords_tab(full_text: str) -> None:
         return
 
     for word, count in keywords:
-        st.write(f"**{word}** — {count}")
+        st.write(f"**{word}**: {count}")
 
 
 def generate_answer(
@@ -203,7 +208,10 @@ def generate_answer(
     answer_source_results,
     reranker,
 ) -> str:
-    #Generate the final answer using either extractive logic or the local LLM.
+    # Only accepted evidence may reach either answer mode.
+    if not answer_source_results:
+        return INSUFFICIENT_CONTEXT_MESSAGE
+
     if answer_mode == "Grounded LLM (Ollama)":
         grounded_context_chunks = [
             item.chunk.text
@@ -224,26 +232,17 @@ def generate_answer(
         answer_source_results,
         reranker,
         max_chunks=2,
-    )
+    ) or INSUFFICIENT_CONTEXT_MESSAGE
 
 
-def render_support_sections(query: str, support_results, reranker, show_debug: bool) -> None:
-    if not support_results:
-        st.warning("Reranking found candidates, but none passed the support display filter.")
+def render_support_sections(support_sections, show_debug: bool) -> None:
+    if not support_sections:
         return
 
-    st.write("### Supporting Sections")
+    st.write("### Retrieved passages")
 
-    for i, ranked in enumerate(support_results, start=1):
-        support_excerpt = extract_support_excerpt(
-            query,
-            ranked,
-            reranker,
-            context_lines=1,
-            max_chars=500,
-        )
-
-        with st.expander(f"Result {i}", expanded=(i == 1)):
+    for i, (ranked, support_excerpt) in enumerate(support_sections, start=1):
+        with st.expander(f"Passage {i}", expanded=(i == 1)):
             st.write(support_excerpt)
 
             if show_debug:
@@ -255,6 +254,15 @@ def render_support_sections(query: str, support_results, reranker, show_debug: b
                 )
 
 
+def reset_question_state(document_id: str | None) -> None:
+    """Clear the saved result when the document changes."""
+    if st.session_state.get("qa_document_id") != document_id:
+        st.session_state["qa_document_id"] = document_id
+        st.session_state.pop("qa_result", None)
+        # Deleting a widget key alone can restore its old frontend value.
+        st.session_state["qa_query"] = ""
+
+
 def render_question_tab(
     chunks: list[DoclingChunk],
     chunk_embeddings: list[list[float]],
@@ -262,73 +270,79 @@ def render_question_tab(
     answer_mode: str,
     ollama_model_name: str,
 ) -> None:
-    st.subheader("Ask a Question")
+    st.subheader("Ask a question")
 
     with st.form("qa_form", clear_on_submit=False):
         query = st.text_input(
             "Type a question about the document",
-            placeholder="Example: What is machine learning according to this paper?",
+            key="qa_query",
+            placeholder="Enter your question.",
         )
         ask_button = st.form_submit_button("Ask")
 
-    if not ask_button or not query.strip():
+    if ask_button and not query.strip():
+        st.warning("Please enter a question.")
+
+    if ask_button and query.strip():
+        query = query.strip()
+        st.session_state.pop("qa_result", None)
+        with st.spinner("Searching the document..."):
+            initial_results = hybrid_retrieve_chunks(
+                query=query,
+                chunks=chunks,
+                embedding_model=get_embedding_model(),
+                chunk_embeddings=chunk_embeddings,
+                top_k=8,
+                lexical_top_k=12,
+                semantic_top_k=12,
+                lexical_min_score=0.02,
+                lexical_weight=1.0,
+                semantic_weight=1.0,
+                rrf_k=60,
+            )
+
+            direct_answer = INSUFFICIENT_CONTEXT_MESSAGE
+            support_sections = []
+            if initial_results:
+                reranker = get_reranker()
+                reranked_results = rerank_chunks(query, initial_results, reranker, top_k=5)
+                support_results = filter_and_deduplicate_supports(
+                    reranked_results, max_results=3, min_rerank_score=0.0,
+                )
+
+                if support_results:
+                    direct_answer = generate_answer(
+                        query=query,
+                        answer_mode=answer_mode,
+                        ollama_model_name=ollama_model_name,
+                        answer_source_results=support_results,
+                        reranker=reranker,
+                    )
+                    support_sections = [
+                        (ranked, extract_support_excerpt(query, ranked, reranker))
+                        for ranked in support_results
+                    ]
+
+            st.session_state["qa_result"] = {
+                "query": query,
+                "answer": direct_answer,
+                "answer_mode": answer_mode,
+                "ollama_model_name": ollama_model_name,
+                "support_sections": support_sections,
+            }
+
+    result = st.session_state.get("qa_result")
+    if result is None:
         return
 
-    embedding_model = get_embedding_model()
-    reranker = get_reranker()
-
-    with st.spinner("Searching the document..."):
-        initial_results = hybrid_retrieve_chunks(
-            query=query,
-            chunks=chunks,
-            embedding_model=embedding_model,
-            chunk_embeddings=chunk_embeddings,
-            top_k=8,
-            lexical_top_k=12,
-            semantic_top_k=12,
-            lexical_min_score=0.02,
-            lexical_weight=1.0,
-            semantic_weight=1.0,
-            rrf_k=60,
-        )
-
-        if not initial_results:
-            st.warning("No relevant sections were found.")
-            return
-
-        reranked_results = rerank_chunks(
-            query,
-            initial_results,
-            reranker,
-            top_k=5,
-        )
-
-        support_results = filter_and_deduplicate_supports(
-            reranked_results,
-            max_results=3,
-            min_rerank_score=0.0,
-        )
-
-        answer_source_results = support_results if support_results else reranked_results
-
-        direct_answer = generate_answer(
-            query=query,
-            answer_mode=answer_mode,
-            ollama_model_name=ollama_model_name,
-            answer_source_results=answer_source_results,
-            reranker=reranker,
-        )
-
-    st.write("### Direct Answer")
-    st.caption(f"Mode: {answer_mode}")
-    st.write(direct_answer)
-
-    render_support_sections(
-        query=query,
-        support_results=support_results,
-        reranker=reranker,
-        show_debug=show_debug,
-    )
+    st.write("### Answer")
+    st.write(f"**Question:** {result['query']}")
+    mode_caption = f"Mode: {result['answer_mode']}"
+    if result["answer_mode"] == "Grounded LLM (Ollama)":
+        mode_caption += f" | Model: {result['ollama_model_name']}"
+    st.caption(mode_caption)
+    st.write(result["answer"])
+    render_support_sections(result["support_sections"], show_debug=show_debug)
 
 
 def render_raw_text_tab(full_text: str) -> None:
@@ -344,10 +358,11 @@ def main() -> None:
 
     uploaded_file = st.file_uploader("Upload a PDF file", type=["pdf"])
 
+    file_bytes = uploaded_file.getvalue() if uploaded_file is not None else None
+    reset_question_state(sha256(file_bytes).hexdigest() if file_bytes is not None else None)
+
     if uploaded_file is None:
         return
-
-    file_bytes = uploaded_file.read()
 
     try:
         full_text, chunk_texts = get_cached_docling_parse(

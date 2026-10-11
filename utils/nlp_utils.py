@@ -64,11 +64,15 @@ class RankedChunk:
 
 @dataclass(frozen=True)
 class TextSpan:
+    """Character offsets refer to the cleaned lines joined with newlines."""
+
     text: str
     line_start: int
     line_end: int
     chunk_lines: list[str]
     parent_rerank_score: float
+    char_start: int
+    char_end: int
 
 
 def _normalize_whitespace(text: str) -> str:
@@ -467,7 +471,7 @@ def filter_and_deduplicate_supports(
 
 def _split_chunk_into_spans(ranked_chunk: RankedChunk) -> list[TextSpan]:
     raw_lines = [
-        line.strip()
+        _clean_display_text(line)
         for line in ranked_chunk.chunk.text.replace("\r", "\n").split("\n")
         if line.strip()
     ]
@@ -475,7 +479,15 @@ def _split_chunk_into_spans(ranked_chunk: RankedChunk) -> list[TextSpan]:
     spans = []
     seen = set()
 
-    def add_span(span_text: str, line_start: int, line_end: int) -> None:
+    line_offsets = []
+    offset = 0
+    for line in raw_lines:
+        line_offsets.append(offset)
+        offset += len(line) + 1
+
+    def add_span(
+        span_text: str, line_start: int, line_end: int, char_start: int, char_end: int,
+    ) -> None:
         cleaned = _clean_display_text(span_text)
         normalized = _normalize_for_similarity(cleaned)
 
@@ -496,18 +508,30 @@ def _split_chunk_into_spans(ranked_chunk: RankedChunk) -> list[TextSpan]:
                 line_end=line_end,
                 chunk_lines=raw_lines,
                 parent_rerank_score=ranked_chunk.rerank_score,
+                char_start=char_start,
+                char_end=char_end,
             )
         )
 
     for line_idx, line in enumerate(raw_lines):
-        add_span(line, line_idx, line_idx)
+        offset = line_offsets[line_idx]
+        add_span(line, line_idx, line_idx, offset, offset + len(line))
 
+        sentence_cursor = 0
         for sentence in sent_tokenize(line):
-            add_span(sentence, line_idx, line_idx)
+            sentence_start = line.index(sentence, sentence_cursor)
+            sentence_cursor = sentence_start + len(sentence)
+            add_span(
+                sentence, line_idx, line_idx,
+                offset + sentence_start, offset + sentence_cursor,
+            )
 
     for line_idx in range(len(raw_lines) - 1):
         combined = raw_lines[line_idx] + "\n" + raw_lines[line_idx + 1]
-        add_span(combined, line_idx, line_idx + 1)
+        add_span(
+            combined, line_idx, line_idx + 1,
+            line_offsets[line_idx], line_offsets[line_idx] + len(combined),
+        )
 
     return spans
 
@@ -553,11 +577,12 @@ def _best_span_for_query(query: str, ranked_chunks: list[RankedChunk], reranker,
 
 
 def _complete_span(span: TextSpan, max_extra_lines: int = 2, max_chars: int = 450) -> str:
-    selected_lines = span.chunk_lines[span.line_start:span.line_end + 1]
-    text = "\n".join(selected_lines).strip()
+    # A sentence span may occupy only part of its source line.
+    selected_lines = [span.text]
+    text = span.text
 
-    if text.endswith((".", "!", "?")) and len(text) >= 60:
-        return _clean_display_text(text)
+    if text.rstrip("\"'\u201d\u2019)]").endswith((".", "!", "?")) or len(text) >= max_chars:
+        return _truncate_text(text, max_chars)
 
     next_line_idx = span.line_end + 1
     added_lines = 0
@@ -580,19 +605,31 @@ def _complete_span(span: TextSpan, max_extra_lines: int = 2, max_chars: int = 45
         added_lines += 1
         next_line_idx += 1
 
-        if next_line.endswith((".", "!", "?")) and len(new_text) >= 60:
+        if next_line.rstrip("\"'\u201d\u2019)]").endswith((".", "!", "?")):
             break
 
-    return _clean_display_text("\n".join(selected_lines))
+    return _truncate_text("\n".join(selected_lines), max_chars)
 
 
 def _truncate_text(text: str, max_chars: int) -> str:
     text = _clean_display_text(text)
 
+    if max_chars <= 0:
+        return ""
+
     if len(text) <= max_chars:
         return text
 
-    return text[:max_chars].rstrip() + "..."
+    if max_chars <= 3:
+        return "." * max_chars
+
+    budget = max_chars - 3
+    shortened = text[:budget].rstrip()
+    if not text[budget - 1].isspace() and not text[budget].isspace():
+        last_break = max(shortened.rfind(" "), shortened.rfind("\n"))
+        if last_break > 0:
+            shortened = shortened[:last_break]
+    return shortened.rstrip() + "..."
 
 
 def extract_support_excerpt(
@@ -618,32 +655,46 @@ def extract_support_excerpt(
     start_line = max(0, best_span.line_start - context_lines)
     end_line = min(len(best_span.chunk_lines) - 1, best_span.line_end + context_lines)
 
-    excerpt_lines = best_span.chunk_lines[start_line:end_line + 1]
-    excerpt_text = _clean_display_text("\n".join(excerpt_lines))
+    # Center the window on the selected sentence, not the start of its line.
+    # Reserve room for omission markers so max_chars is a strict total limit.
+    if max_chars <= 8:
+        return _truncate_text(best_span.text, max_chars)
 
-    if start_line > 0:
+    chunk_text = "\n".join(best_span.chunk_lines)
+    context_start = sum(len(line) + 1 for line in best_span.chunk_lines[:start_line])
+    context_end = sum(len(line) + 1 for line in best_span.chunk_lines[:end_line + 1]) - 1
+    budget = max_chars - 8
+    span_length = best_span.char_end - best_span.char_start
+    extra = max(0, budget - span_length)
+    start = max(context_start, best_span.char_start - extra // 2)
+    end = min(context_end, start + budget)
+
+    # Only trim partial words outside the selected evidence.
+    while start < best_span.char_start and start > 0 and not chunk_text[start - 1].isspace():
+        start += 1
+    while end > best_span.char_end and end < len(chunk_text) and not chunk_text[end].isspace():
+        end -= 1
+
+    excerpt_text = chunk_text[start:end].strip()
+    if start > 0:
         excerpt_text = "...\n" + excerpt_text
-
-    if end_line < len(best_span.chunk_lines) - 1:
-        excerpt_text = excerpt_text + "\n..."
-
-    return _truncate_text(excerpt_text, max_chars)
+    if end < len(chunk_text):
+        excerpt_text += "\n..."
+    return excerpt_text
 
 
 def extract_direct_answer(query: str, reranked_results, reranker, max_chunks: int = 2) -> str:
     if not reranked_results:
         return ""
 
-    usable_results = [
-        ranked
-        for ranked in reranked_results
-        if not _is_low_value_text(ranked.chunk.text)
-    ]
-
-    answer_sources = usable_results if usable_results else reranked_results
+    answer_sources = filter_and_deduplicate_supports(
+        reranked_results, max_results=max_chunks, min_rerank_score=0.0,
+    )
+    if not answer_sources:
+        return ""
     best_span = _best_span_for_query(query, answer_sources, reranker, max_chunks=max_chunks)
 
     if best_span is None:
-        return _truncate_text(answer_sources[0].chunk.text, max_chars=450)
+        return ""
 
     return _complete_span(best_span)
