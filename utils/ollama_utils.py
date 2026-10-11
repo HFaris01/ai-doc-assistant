@@ -9,7 +9,7 @@ OLLAMA_HOST = os.getenv("OLLAMA_HOST", "http://localhost:11434")
 DEFAULT_OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "gemma3:latest")
 
 INSUFFICIENT_CONTEXT_MESSAGE = (
-    "I could not find a reliable answer in the provided document context."
+    "There is not enough information in the retrieved passages to answer this question."
 )
 
 
@@ -35,18 +35,20 @@ def build_grounded_messages(query: str, context_chunks: list[str]) -> list[dict]
     context_text = _format_context_chunks(context_chunks)
 
     system_prompt = (
-        "You are a document question-answering assistant.\n"
+        "You answer questions about documents.\n"
         "Answer only from the provided document context.\n"
         "Do not use outside knowledge.\n"
         f"If the context is insufficient, say: '{INSUFFICIENT_CONTEXT_MESSAGE}'\n"
-        "Keep the answer concise, clear, and directly related to the question.\n"
+        "Keep the answer brief and focused on the question.\n"
+        "Use plain language without slogans or rhetorical contrasts.\n"
+        "Prefer short sentences over dashes or semicolons.\n"
         "Do not invent facts.\n"
     )
 
     user_prompt = (
         f"Question:\n{query.strip()}\n\n"
         f"Document context:\n{context_text}\n\n"
-        "Write a grounded answer based only on the context above."
+        "Answer the question using only the document context above."
     )
 
     return [
@@ -90,7 +92,7 @@ def generate_grounded_answer_ollama(
     answer = _extract_response_text(response)
 
     if not answer:
-        return "I could not generate an answer from the local model."
+        return "No answer was returned by Ollama."
 
     return answer
 
@@ -131,17 +133,17 @@ def check_ollama_connection(model_name: str = DEFAULT_OLLAMA_MODEL) -> tuple[boo
         model_names = _extract_model_names(models_response)
 
         if not model_names:
-            return False, "Ollama is reachable, but no local models were found."
+            return False, "Ollama is running. No local models were found."
 
         if not _is_model_available(model_name, model_names):
             available_models = ", ".join(model_names)
             return (
                 False,
-                f"Ollama is reachable, but model '{model_name}' was not found. "
+                f"Ollama is running. Model '{model_name}' was not found. "
                 f"Available models: {available_models}",
             )
 
-        return True, "Ollama is running and the model is available."
+        return True, "Ollama is ready."
 
     except Exception as e:
         return False, f"Could not connect to Ollama: {e}"
