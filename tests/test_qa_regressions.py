@@ -212,6 +212,63 @@ class QARegressionTests(unittest.TestCase):
             source = "\n".join(span.chunk_lines)
             self.assertEqual(source[span.char_start:span.char_end], span.text)
 
+    def test_negative_values_survive_cleanup_answers_and_excerpts(self):
+        for value in ("-12", "-12.5", "-.5", "\u221212"):
+            sentence = value + " degrees Celsius was the lowest temperature measured during the winter survey."
+            for bullet in ("", "- ", "\u2022 ", "- - ", "\u2022- "):
+                with self.subTest(value=value, bullet=bullet):
+                    ranked = self.ranked(bullet + sentence)
+                    cleaned = self.nlp._clean_display_text(ranked.chunk.text)
+                    self.assertEqual(cleaned, sentence)
+                    self.assertEqual(self.nlp._clean_display_text(cleaned), sentence)
+                    self.assertEqual(
+                        self.nlp.extract_direct_answer("What was the lowest temperature?", [ranked], self.reranker),
+                        sentence,
+                    )
+                    self.assertEqual(
+                        self.nlp.extract_support_excerpt("What was the lowest temperature?", ranked, self.reranker),
+                        sentence,
+                    )
+                    for span in self.nlp._split_chunk_into_spans(ranked):
+                        source = "\n".join(span.chunk_lines)
+                        self.assertEqual(source[span.char_start:span.char_end], span.text)
+
+    def test_multiline_bullet_cleanup_preserves_negative_values(self):
+        text = "- -12 degrees Celsius\n  \u2022 -15 percent\n- -.5 degrees Celsius"
+        expected = "-12 degrees Celsius\n-15 percent\n-.5 degrees Celsius"
+        cleaned = self.nlp._clean_display_text(text)
+        self.assertEqual(cleaned, expected)
+        self.assertEqual(self.nlp._clean_display_text(cleaned), expected)
+
+    def test_excerpt_preserves_full_text_up_to_the_limit(self):
+        for length in range(491, 501):
+            prefix = "The warranty applies to all eligible products "
+            sentence = prefix + "x" * (length - len(prefix) - len(" only.")) + " only."
+            with self.subTest(length=length):
+                excerpt = self.nlp.extract_support_excerpt(self.st.query, self.ranked(sentence), self.reranker)
+                self.assertEqual(excerpt, sentence)
+
+    def test_excerpt_reserves_only_the_markers_it_displays(self):
+        for before, after in ((False, True), (True, False), (True, True)):
+            prefix = "The warranty applies to all eligible products "
+            sentence_length = 500 - 4 * (before + after)
+            sentence = prefix + "x" * (sentence_length - len(prefix) - len(" only.")) + " only."
+            reranker = SimpleNamespace(predict=lambda pairs: [
+                10.0 if text == sentence else -10.0 for query, text in pairs
+            ])
+            for separator in (" ", "\n"):
+                for context_lines in (0, 1):
+                    with self.subTest(before=before, after=after, separator=separator, context_lines=context_lines):
+                        text = separator.join(
+                            ([BACKGROUND.strip()] if before else []) + [sentence]
+                            + ([BACKGROUND.strip()] if after else [])
+                        )
+                        excerpt = self.nlp.extract_support_excerpt(
+                            self.st.query, self.ranked(text), reranker, context_lines=context_lines,
+                        )
+                        expected = ("...\n" if before else "") + sentence + ("\n..." if after else "")
+                        self.assertEqual(excerpt, expected)
+
     def test_complete_short_sentence_does_not_append_next_line(self):
         for text in (
             "All submitted applications require a valid signature.",

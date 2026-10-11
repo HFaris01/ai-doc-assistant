@@ -84,8 +84,8 @@ def _normalize_whitespace(text: str) -> str:
 
 def _clean_display_text(text: str) -> str:
     text = _normalize_whitespace(text)
-    text = re.sub(r"^[•\-\u2022]+\s*", "", text)
-    text = re.sub(r"\n[•\-\u2022]+\s*", "\n", text)
+    # Hyphen bullets need following whitespace so numeric signs survive cleanup.
+    text = re.sub(r"(?m)^[ \t]*(?:\u2022[ \t]*|-+[ \t]+)+", "", text)
     text = re.sub(r"\s+([,.;:!?])", r"\1", text)
     return text.strip()
 
@@ -655,19 +655,40 @@ def extract_support_excerpt(
     start_line = max(0, best_span.line_start - context_lines)
     end_line = min(len(best_span.chunk_lines) - 1, best_span.line_end + context_lines)
 
-    # Center the window on the selected sentence, not the start of its line.
-    # Reserve room for omission markers so max_chars is a strict total limit.
     if max_chars <= 8:
         return _truncate_text(best_span.text, max_chars)
 
     chunk_text = "\n".join(best_span.chunk_lines)
     context_start = sum(len(line) + 1 for line in best_span.chunk_lines[:start_line])
     context_end = sum(len(line) + 1 for line in best_span.chunk_lines[:end_line + 1]) - 1
-    budget = max_chars - 8
-    span_length = best_span.char_end - best_span.char_start
-    extra = max(0, budget - span_length)
-    start = max(context_start, best_span.char_start - extra // 2)
-    end = min(context_end, start + budget)
+    prefix_length = 4 if context_start > 0 else 0
+    suffix_length = 4 if context_end < len(chunk_text) else 0
+
+    if context_end - context_start + prefix_length + suffix_length <= max_chars:
+        start, end = context_start, context_end
+    else:
+        # Compare windows at either context edge with one centered on the evidence.
+        # Each window reserves space for the omission markers it needs.
+        left_end = context_start + max_chars - prefix_length - 4
+        right_start = context_end - (max_chars - 4 - suffix_length)
+        budget = max_chars - 8
+        extra = max(0, budget - (best_span.char_end - best_span.char_start))
+        centered_start = max(context_start, best_span.char_start - extra // 2)
+        centered_end = min(context_end, centered_start + budget)
+        centered_start = max(context_start, centered_end - budget)
+
+        def window_score(window: tuple[int, int]) -> tuple[int, int, int]:
+            start, end = window
+            coverage = max(0, min(end, best_span.char_end) - max(start, best_span.char_start))
+            omitted_start = max(0, start - best_span.char_start)
+            before = max(0, best_span.char_start - start)
+            after = max(0, end - best_span.char_end)
+            return coverage, -omitted_start, -abs(before - after)
+
+        start, end = max(
+            [(context_start, left_end), (right_start, context_end), (centered_start, centered_end)],
+            key=window_score,
+        )
 
     # Only trim partial words outside the selected evidence.
     while start < best_span.char_start and start > 0 and not chunk_text[start - 1].isspace():
